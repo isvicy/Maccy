@@ -1,0 +1,26 @@
+Source: ~/Library/Containers/org.p0deje.Maccy.dev/Data/Library/Application Support/Maccy/Storage.sqlite
+Rows:   27929
+FTS:    present
+---
+
+== launch sim (most-recent 200 unpinned) ==
+fetch + sort by lastCopiedAt DESC LIMIT 200     22 ms (min of 3)
+
+== predicate search (LIKE on ZTITLE) ==
+  query='generate'                           22 ms (min of 3)
+  query='error'                              22 ms (min of 3)
+  query='北京'                             22 ms (min of 3)
+  query='https'                              21 ms (min of 3)
+  query='function'                           22 ms (min of 3)
+
+== full content scan (LIKE on ZHISTORYITEMCONTENT.ZVALUE) ==
+(this is what Phase 3 FTS replaces — same semantic, full text)
+  query='generate'                           51 ms (min of 3)
+  query='北京'                             54 ms (min of 3)
+
+== FTS5 search ==
+  query='generate'                           21 ms (min of 3)
+  query='error'                              22 ms (min of 3)
+  query='北京'                             19 ms (min of 3)
+  query='https'                              22 ms (min of 3)
+  query='function'                           23 ms (min of 3)
