@@ -59,6 +59,10 @@ class HistoryItem {
     NSPasteboard.PasteboardType.notesRichText.rawValue
   ]
 
+  // SQL index on (pin, lastCopiedAt DESC). Used by Phase 1's lazy windowed
+  // load: `WHERE pin IS NULL ORDER BY lastCopiedAt DESC LIMIT N`.
+  #Index<HistoryItem>([\.pin], [\.lastCopiedAt], [\.pin, \.lastCopiedAt])
+
   var application: String?
   var firstCopiedAt: Date = Date.now
   var lastCopiedAt: Date = Date.now

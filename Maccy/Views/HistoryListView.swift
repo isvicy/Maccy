@@ -98,6 +98,16 @@ struct HistoryListView: View {
       ScrollViewReader { proxy in
         MultipleSelectionListView(items: unpinnedItems) { previous, item, next, index in
           HistoryItemView(item: item, previous: previous, next: next, index: index)
+            .onAppear {
+              // Phase 1: trigger lazy load when the user scrolls within 20 rows of the
+              // loaded window's tail. loadMore() is reentrancy-guarded so multiple
+              // trailing rows firing onAppear in quick succession only fetch once.
+              if appState.history.searchQuery.isEmpty,
+                 index >= unpinnedItems.count - 20,
+                 appState.history.hasMoreToLoad {
+                Task { await appState.history.loadMore() }
+              }
+            }
         }
         .padding(.top, scrollTopPadding)
         .padding(.bottom, scrollBottomPadding)

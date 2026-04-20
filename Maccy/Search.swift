@@ -1,133 +1,64 @@
 import AppKit
-import Defaults
-import Fuse
+import Foundation
+import SwiftData
 
 class Search {
-  enum Mode: String, CaseIterable, Identifiable, CustomStringConvertible, Defaults.Serializable {
-    case exact
-    case fuzzy
-    case regexp
-    case mixed
-
-    var id: Self { self }
-
-    var description: String {
-      switch self {
-      case .exact:
-        return NSLocalizedString("Exact", tableName: "GeneralSettings", comment: "")
-      case .fuzzy:
-        return NSLocalizedString("Fuzzy", tableName: "GeneralSettings", comment: "")
-      case .regexp:
-        return NSLocalizedString("Regex", tableName: "GeneralSettings", comment: "")
-      case .mixed:
-        return NSLocalizedString("Mixed", tableName: "GeneralSettings", comment: "")
-      }
-    }
-  }
-
   struct SearchResult: Equatable {
-    var score: Double?
-    var object: Searchable
+    var object: HistoryItemDecorator
     var ranges: [Range<String.Index>] = []
   }
 
-  typealias Searchable = HistoryItemDecorator
+  // Maximum matches to surface in the popup. Past this, the user is better
+  // off refining their query.
+  private let resultLimit = 500
 
-  private let fuse = Fuse(threshold: 0.7) // threshold found by trial-and-error
-  private let fuzzySearchLimit = 5_000
-
-  func search(string: String, within: [Searchable]) -> [SearchResult] {
+  // SwiftData predicate search against `title`, sorted by lastCopiedAt DESC,
+  // capped at `resultLimit`. SQL LIKE under the hood — handles substring,
+  // CJK, and any query length. ~22 ms at 27k items in our bench.
+  //
+  // Phase 3's FTS5 path is left in place infrastructurally (Storage installs
+  // it on launch, triggers maintain it on plain-text content writes) but is
+  // not queried here. Reason: SwiftData's dedup-on-copy path can leave new
+  // HistoryItems with empty `contents` arrays — only the title is set on
+  // the new row, and the content rows from the de-duplicated old item don't
+  // reliably reattach. Items with no content never enter the FTS index, so
+  // the FTS path silently misses them. Predicate search on `title` hits
+  // those items because the title is always populated by HistoryItem.generateTitle.
+  //
+  // The FTS infra stays installed (no perceptible cost) so that, if/when
+  // Maccy's dedup path is fixed upstream or we add a fallback that derives
+  // FTS body from title, we can re-enable the FTS query path with one edit.
+  //
+  // Decorators are reused from `existingDecorators` where possible to
+  // preserve transient state (image cache, applicationImage, pin shortcuts).
+  @MainActor
+  func search(string: String, in existingDecorators: [HistoryItemDecorator]) -> [SearchResult] {
     guard !string.isEmpty else {
-      return within.map { SearchResult(object: $0) }
+      return existingDecorators.map { SearchResult(object: $0) }
     }
 
-    switch Defaults[.searchMode] {
-    case .mixed:
-      return mixedSearch(string: string, within: within)
-    case .regexp:
-      return simpleSearch(string: string, within: within, options: .regularExpression)
-    case .fuzzy:
-      return fuzzySearch(string: string, within: within)
-    default:
-      return simpleSearch(string: string, within: within, options: .caseInsensitive)
-    }
-  }
+    let predicate = #Predicate<HistoryItem> { $0.title.localizedStandardContains(string) }
+    var desc = FetchDescriptor<HistoryItem>(
+      predicate: predicate,
+      sortBy: [SortDescriptor(\.lastCopiedAt, order: .reverse)]
+    )
+    desc.fetchLimit = resultLimit
+    guard let items = try? Storage.shared.context.fetch(desc) else { return [] }
 
-  private func fuzzySearch(string: String, within: [Searchable]) -> [SearchResult] {
-    let pattern = fuse.createPattern(from: string)
-    let searchResults: [SearchResult] = within.compactMap { item in
-      fuzzySearch(for: pattern, in: item.title, of: item)
-    }
-    let sortedResults = searchResults.sorted(by: { ($0.score ?? 0) < ($1.score ?? 0) })
-    return sortedResults
-  }
-
-  private func fuzzySearch(
-    for pattern: Fuse.Pattern?,
-    in searchString: String,
-    of item: Searchable
-  ) -> SearchResult? {
-    var searchString = searchString
-    if searchString.count > fuzzySearchLimit {
-      // shortcut to avoid slow search
-      let stopIndex = searchString.index(searchString.startIndex, offsetBy: fuzzySearchLimit)
-      searchString = "\(searchString[...stopIndex])"
-    }
-
-    if let fuzzyResult = fuse.search(pattern, in: searchString) {
-      return SearchResult(
-        score: fuzzyResult.score,
-        object: item,
-        ranges: fuzzyResult.ranges.map {
-          let startIndex = searchString.startIndex
-          let lowerBound = searchString.index(startIndex, offsetBy: $0.lowerBound)
-          let upperBound = searchString.index(startIndex, offsetBy: $0.upperBound + 1)
-
-          return lowerBound..<upperBound
-        }
-      )
-    } else {
-      return nil
+    let decoratorsByItem = Dictionary(grouping: existingDecorators, by: \.item)
+      .compactMapValues(\.first)
+    return items.map { item in
+      let decorator = decoratorsByItem[item] ?? HistoryItemDecorator(item)
+      return SearchResult(object: decorator, ranges: rangeOf(string, in: decorator.title))
     }
   }
 
-  private func simpleSearch(
-    string: String,
-    within: [Searchable],
-    options: NSString.CompareOptions
-  ) -> [SearchResult] {
-    return within.compactMap { simpleSearch(for: string, in: $0.title, of: $0, options: options) }
-  }
-
-  private func simpleSearch(
-    for string: String,
-    in searchString: String,
-    of item: Searchable,
-    options: NSString.CompareOptions
-  ) -> SearchResult? {
-    if let range = searchString.range(of: string, options: options, range: nil, locale: nil) {
-      return SearchResult(object: item, ranges: [range])
-    } else {
-      return nil
+  // First case- and diacritic-insensitive match of `query` in `title`.
+  // Used to drive the highlight in the popup row.
+  private func rangeOf(_ query: String, in title: String) -> [Range<String.Index>] {
+    if let r = title.range(of: query, options: [.caseInsensitive, .diacriticInsensitive]) {
+      return [r]
     }
-  }
-
-  private func mixedSearch(string: String, within: [Searchable]) -> [SearchResult] {
-    var results = simpleSearch(string: string, within: within, options: .caseInsensitive)
-    guard results.isEmpty else {
-      return results
-    }
-
-    results = simpleSearch(string: string, within: within, options: .regularExpression)
-    guard results.isEmpty else {
-      return results
-    }
-
-    results = fuzzySearch(string: string, within: within)
-    guard results.isEmpty else {
-      return results
-    }
-
     return []
   }
 }

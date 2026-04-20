@@ -21,11 +21,15 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
 
   var searchQuery: String = "" {
     didSet {
-      throttler.throttle { [self] in
-        updateItems(search.search(string: searchQuery, within: all))
+      // Phase 2: search now hits SwiftData directly across the full on-disk
+      // store. Throttler is gone — DB query is fast enough that throttling
+      // costs more (latency) than it saves (CPU).
+      Task { @MainActor in
+        let results = self.search.search(string: self.searchQuery, in: self.all)
+        self.updateItems(results)
 
-        if searchQuery.isEmpty {
-          AppState.shared.navigator.select(item: unpinnedItems.first)
+        if self.searchQuery.isEmpty {
+          AppState.shared.navigator.select(item: self.unpinnedItems.first)
         } else {
           AppState.shared.navigator.highlightFirst()
         }
@@ -54,16 +58,37 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
 
   private let search = Search()
   private let sorter = Sorter()
-  private let throttler = Throttler(minimumDelay: 0.2)
 
   @ObservationIgnored
   private var sessionLog: [Int: HistoryItem] = [:]
 
   // The distinction between `all` and `items` is the following:
-  // - `all` stores all history items, even the ones that are currently hidden by a search
-  // - `items` stores only visible history items, updated during a search
+  // - `all` stores history items materialised into memory: pinned + the loaded window
+  //   of unpinned. The window grows via `loadMore()` as the user scrolls.
+  // - `items` stores only visible history items, updated during a search.
   @ObservationIgnored
   var all: [HistoryItemDecorator] = []
+
+  // Phase 1 — lazy load. Fetch one page at a time as the user scrolls.
+  // Initial load = pinned + first pageSize unpinned. Older items materialise on demand.
+  private let pageSize = 200
+
+  // Total unpinned count on disk (refreshed on load / add / delete). Used to detect
+  // when loadMore() has nothing left to fetch.
+  @ObservationIgnored
+  private var totalUnpinnedOnDisk = 0
+
+  // Count of unpinned items currently in `all`. Always ≤ totalUnpinnedOnDisk.
+  @ObservationIgnored
+  private var loadedUnpinnedCount = 0
+
+  // True iff there are more unpinned items on disk than currently in `all`.
+  var hasMoreToLoad: Bool { loadedUnpinnedCount < totalUnpinnedOnDisk }
+
+  // Reentrancy guard for loadMore — onAppear of trailing rows can fire several
+  // times before the in-flight fetch completes.
+  @ObservationIgnored
+  private var isLoadingMore = false
 
   init() {
     Task {
@@ -103,26 +128,87 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
 
   @MainActor
   func load() async throws {
-    let descriptor = FetchDescriptor<HistoryItem>()
-    let results = try Storage.shared.context.fetch(descriptor)
-    all = sorter.sort(results).map { HistoryItemDecorator($0) }
+    // Pinned items: fetch all (small N, drives the top-bar pin section).
+    let pinnedDesc = FetchDescriptor<HistoryItem>(predicate: #Predicate { $0.pin != nil })
+    let pinned = try Storage.shared.context.fetch(pinnedDesc)
+
+    // Unpinned items: fetch only the first page, sorted by lastCopiedAt DESC at the SQL layer.
+    var unpinnedDesc = FetchDescriptor<HistoryItem>(
+      predicate: #Predicate { $0.pin == nil },
+      sortBy: [SortDescriptor(\.lastCopiedAt, order: .reverse)]
+    )
+    unpinnedDesc.fetchLimit = pageSize
+    let unpinned = try Storage.shared.context.fetch(unpinnedDesc)
+
+    // Total unpinned count for loadMore() bookkeeping. Cheap on macOS 15 — uses COUNT(*).
+    totalUnpinnedOnDisk = (try? Storage.shared.context.fetchCount(
+      FetchDescriptor<HistoryItem>(predicate: #Predicate { $0.pin == nil })
+    )) ?? unpinned.count
+    loadedUnpinnedCount = unpinned.count
+
+    // Sorter still owns the pin-vs-unpinned ordering policy (top vs bottom, etc).
+    all = sorter.sort(pinned + unpinned).map { HistoryItemDecorator($0) }
     items = all
 
-    limitHistorySize(to: Defaults[.size])
+    limitHistorySizeOnDisk(to: Defaults[.size])
 
     updateShortcuts()
-    // Ensure that panel size is proper *after* loading all items.
     Task {
       AppState.shared.popup.needsResize = true
     }
   }
 
+  // Append the next page of unpinned items to the loaded window.
+  // Triggered by HistoryListView when the trailing-edge row appears.
   @MainActor
-  private func limitHistorySize(to maxSize: Int) {
-    let unpinned = all.filter(\.isUnpinned)
-    if unpinned.count >= maxSize {
-      unpinned[maxSize...].forEach(delete)
+  func loadMore() async {
+    guard hasMoreToLoad, !isLoadingMore else { return }
+    isLoadingMore = true
+    defer { isLoadingMore = false }
+
+    var desc = FetchDescriptor<HistoryItem>(
+      predicate: #Predicate { $0.pin == nil },
+      sortBy: [SortDescriptor(\.lastCopiedAt, order: .reverse)]
+    )
+    desc.fetchLimit = pageSize
+    desc.fetchOffset = loadedUnpinnedCount
+    guard let next = try? Storage.shared.context.fetch(desc), !next.isEmpty else { return }
+
+    let decorators = next.map { HistoryItemDecorator($0) }
+    all.append(contentsOf: decorators)
+    loadedUnpinnedCount += next.count
+
+    // If no active search, mirror to visible items immediately. Otherwise the
+    // search filter will pick the new items up on its next refresh.
+    if searchQuery.isEmpty {
+      items = all
     }
+    updateUnpinnedShortcuts()
+  }
+
+  // Evict items beyond maxSize from the on-disk store *and* from the loaded window.
+  // Replaces the old `limitHistorySize`, which only operated on the in-memory `all` array.
+  @MainActor
+  private func limitHistorySizeOnDisk(to maxSize: Int) {
+    guard totalUnpinnedOnDisk > maxSize else { return }
+    var desc = FetchDescriptor<HistoryItem>(
+      predicate: #Predicate { $0.pin == nil },
+      sortBy: [SortDescriptor(\.lastCopiedAt, order: .reverse)]
+    )
+    desc.fetchOffset = maxSize
+    guard let toEvict = try? Storage.shared.context.fetch(desc), !toEvict.isEmpty else { return }
+    for item in toEvict {
+      if let dec = all.first(where: { $0.item == item }) {
+        delete(dec)
+      } else {
+        // Not in loaded window; delete directly from store.
+        Storage.shared.context.delete(item)
+      }
+    }
+    try? Storage.shared.context.save()
+    totalUnpinnedOnDisk = (try? Storage.shared.context.fetchCount(
+      FetchDescriptor<HistoryItem>(predicate: #Predicate { $0.pin == nil })
+    )) ?? totalUnpinnedOnDisk
   }
 
   @MainActor
@@ -169,7 +255,13 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
 
     // Remove exceeding items. Do this after the item is added to avoid removing something
     // if a duplicate was found as then the size already stayed the same.
-    limitHistorySize(to: Defaults[.size] - 1)
+    // Phase 1: count is across the full on-disk store, not just the loaded window —
+    // limitHistorySizeOnDisk handles eviction below the window too.
+    if removedItemIndex == nil && item.pin == nil {
+      // Net +1 unpinned item on disk.
+      totalUnpinnedOnDisk += 1
+    }
+    limitHistorySizeOnDisk(to: Defaults[.size] - 1)
 
     sessionLog[Clipboard.shared.changeCount] = item
 
@@ -186,6 +278,10 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
       let sortedItems = sorter.sort(all.map(\.item) + [item])
       if let index = sortedItems.firstIndex(of: item) {
         all.insert(itemDecorator, at: index)
+      }
+      // Net new unpinned item now in `all`. (Duplicate replacement net-zero.)
+      if removedItemIndex == nil {
+        loadedUnpinnedCount += 1
       }
 
       items = all
@@ -220,6 +316,8 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
       all.removeAll(where: \.isUnpinned)
       sessionLog.removeValues { $0.pin == nil }
       items = all
+      totalUnpinnedOnDisk = 0
+      loadedUnpinnedCount = 0
 
       try? Storage.shared.context.transaction {
         try? Storage.shared.context.delete(
@@ -251,6 +349,8 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
       all.removeAll()
       sessionLog.removeAll()
       items = all
+      totalUnpinnedOnDisk = 0
+      loadedUnpinnedCount = 0
 
       try? Storage.shared.context.delete(model: HistoryItem.self)
       Storage.shared.context.processPendingChanges()
@@ -268,6 +368,8 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
   func delete(_ item: HistoryItemDecorator?) {
     guard let item else { return }
 
+    let wasUnpinnedAndLoaded = item.isUnpinned && all.contains(where: { $0 == item })
+
     cleanup(item)
     withLogging("Removing history item") {
       Storage.shared.context.delete(item.item)
@@ -278,6 +380,13 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
     all.removeAll { $0 == item }
     items.removeAll { $0 == item }
     sessionLog.removeValues { $0 == item.item }
+
+    if wasUnpinnedAndLoaded {
+      loadedUnpinnedCount -= 1
+      totalUnpinnedOnDisk -= 1
+    } else if item.isUnpinned {
+      totalUnpinnedOnDisk -= 1
+    }
 
     updateUnpinnedShortcuts()
     Task {
