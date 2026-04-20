@@ -253,15 +253,14 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
       }
     }
 
-    // Remove exceeding items. Do this after the item is added to avoid removing something
-    // if a duplicate was found as then the size already stayed the same.
-    // Phase 1: count is across the full on-disk store, not just the loaded window —
-    // limitHistorySizeOnDisk handles eviction below the window too.
+    // Phase 1: count bookkeeping. Eviction happens at load() only, not per
+    // add() — running delete()+save() inside add()'s save chain causes Core
+    // Data optimistic-lock crashes (NSManagedObjectContext._thereIsNoSadness…).
+    // The trade-off is the on-disk count can drift slightly past historySize
+    // between launches; the next load() trims it back.
     if removedItemIndex == nil && item.pin == nil {
-      // Net +1 unpinned item on disk.
       totalUnpinnedOnDisk += 1
     }
-    limitHistorySizeOnDisk(to: Defaults[.size] - 1)
 
     sessionLog[Clipboard.shared.changeCount] = item
 
