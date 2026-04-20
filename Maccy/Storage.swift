@@ -33,9 +33,13 @@ class Storage {
       fatalError("Cannot load database: \(error.localizedDescription).")
     }
 
-    // Phase 3: install FTS5 sidecar + maintenance triggers and backfill if
-    // newly created. Idempotent — gated by a version row.
-    FTSIndex.shared.bootstrap()
+    // Phase 3 FTS5 sidecar disabled: the trigger-driven mirror was
+    // suspected of causing _thereIsNoSadnessLikeTheDeathOfOptimism crashes
+    // on app activation (Core Data optimistic lock during save). Search.swift
+    // uses the Phase 2 predicate path against `title`, so the FTS index
+    // isn't queried anyway. Dead weight — disabled here, FTSIndex class
+    // kept around in case we revisit with a different sync strategy.
+    // FTSIndex.shared.bootstrap()
   }
 }
 
