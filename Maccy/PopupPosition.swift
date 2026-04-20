@@ -64,6 +64,18 @@ enum PopupPosition: String, CaseIterable, Identifiable, CustomStringConvertible,
 
     var point = NSEvent.mouseLocation
     point.y -= size.height
+
+    // Clamp to the visible frame of the screen the cursor is on, so the
+    // popup never spills past a screen edge. Without this, opening near
+    // the bottom of the screen (as in a terminal at the bottom) clips
+    // the popup off the screen.
+    let cursorScreen = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? .main
+    if let frame = cursorScreen?.visibleFrame {
+      if point.y < frame.minY { point.y = frame.minY }
+      if point.y + size.height > frame.maxY { point.y = frame.maxY - size.height }
+      if point.x < frame.minX { point.x = frame.minX }
+      if point.x + size.width > frame.maxX { point.x = frame.maxX - size.width }
+    }
     return point
   }
 }
