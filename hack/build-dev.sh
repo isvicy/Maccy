@@ -30,7 +30,11 @@ mkdir -p build
 # grants persist. Falls back to ad-hoc if the cert isn't installed yet.
 # Run hack/setup-dev-cert.sh once to create it.
 DEV_CERT="Maccy Dev Self-Signed"
-if security find-identity -p codesigning -v 2>/dev/null | grep -q "$DEV_CERT"; then
+# Drop `-v` so we also accept untrusted identities. Self-signed certs are
+# always untrusted (CSSMERR_TP_NOT_TRUSTED), but codesign itself doesn't
+# care about trust — only signature equivalence. With `-v` filtered, the
+# script would silently fall back to ad-hoc and TCC grants would break.
+if security find-identity -p codesigning 2>/dev/null | grep -q "$DEV_CERT"; then
   SIGN_IDENTITY="$DEV_CERT"
 else
   echo "warn: '$DEV_CERT' not in keychain — falling back to ad-hoc signing."

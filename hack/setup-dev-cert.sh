@@ -21,9 +21,23 @@ set -euo pipefail
 CERT_NAME="Maccy Dev Self-Signed"
 KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
 
-if security find-identity -p codesigning -v "$KEYCHAIN" 2>/dev/null | grep -q "$CERT_NAME"; then
+# No `-v`: self-signed identities are always untrusted; codesign accepts them anyway.
+if security find-identity -p codesigning "$KEYCHAIN" 2>/dev/null | grep -q "$CERT_NAME"; then
   echo "Identity '$CERT_NAME' already exists in login keychain. Nothing to do."
   exit 0
+fi
+
+# Clean up orphan cert entries from prior failed runs (same label, no
+# matching private key — would prevent the new identity from being usable).
+# `delete-certificate -c name` silently no-ops in some macOS versions; use
+# explicit SHA-1 hash deletion instead.
+HASHES=$(security find-certificate -a -c "$CERT_NAME" -Z "$KEYCHAIN" 2>/dev/null \
+  | awk '/SHA-1 hash:/ {print $NF}')
+if [[ -n "$HASHES" ]]; then
+  for H in $HASHES; do
+    echo "Removing orphan cert $H"
+    security delete-certificate -Z "$H" "$KEYCHAIN" >/dev/null 2>&1
+  done
 fi
 
 TMP=$(mktemp -d)
@@ -51,36 +65,35 @@ openssl req -x509 -newkey rsa:2048 \
   -extensions v3 \
   >/dev/null 2>&1
 
+P12_PASS="maccydev"
 openssl pkcs12 -export -legacy \
+  -macalg sha1 \
+  -keypbe PBE-SHA1-3DES \
+  -certpbe PBE-SHA1-3DES \
   -out "$TMP/cert.p12" \
   -inkey "$TMP/key.pem" \
   -in "$TMP/cert.pem" \
   -name "$CERT_NAME" \
-  -password pass:
+  -password "pass:$P12_PASS"
 
 echo ""
 echo "Importing into login keychain. You may be prompted for your login password."
 security import "$TMP/cert.p12" \
   -k "$KEYCHAIN" \
-  -P "" \
+  -P "$P12_PASS" \
   -T /usr/bin/codesign
 
 echo ""
 echo "Allowing codesign to use the key without per-launch prompt."
-echo "You will be prompted for your login password once more."
+echo "Enter your LOGIN keychain password when prompted (this is your Mac login password)."
 security set-key-partition-list \
-  -S "apple-tool:,apple:,codesign:" \
-  -s -k "" \
-  "$KEYCHAIN" \
-  >/dev/null 2>&1 || \
-  security set-key-partition-list \
   -S "apple-tool:,apple:,codesign:" \
   -s \
   "$KEYCHAIN"
 
 echo ""
-echo "Done. Verifying:"
-security find-identity -p codesigning -v "$KEYCHAIN" | grep "$CERT_NAME" || {
+echo "Done. Verifying (self-signed → expect CSSMERR_TP_NOT_TRUSTED — that's fine for codesign):"
+security find-identity -p codesigning "$KEYCHAIN" | grep "$CERT_NAME" || {
   echo "WARNING: identity not found after import." >&2
   exit 1
 }
