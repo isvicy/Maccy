@@ -25,6 +25,19 @@ APP="$DERIVED/Build/Products/$CONFIG/Maccy-dev.app"
 
 mkdir -p build
 
+# Sign with our self-signed dev cert if it exists in the keychain — keeps
+# the bundle signature stable across rebuilds so TCC (Accessibility, etc.)
+# grants persist. Falls back to ad-hoc if the cert isn't installed yet.
+# Run hack/setup-dev-cert.sh once to create it.
+DEV_CERT="Maccy Dev Self-Signed"
+if security find-identity -p codesigning -v 2>/dev/null | grep -q "$DEV_CERT"; then
+  SIGN_IDENTITY="$DEV_CERT"
+else
+  echo "warn: '$DEV_CERT' not in keychain — falling back to ad-hoc signing."
+  echo "      run hack/setup-dev-cert.sh once for stable TCC grants across rebuilds."
+  SIGN_IDENTITY="-"
+fi
+
 # PRODUCT_NAME override leaks into SPM package bundles and causes duplicate
 # output paths. So we leave PRODUCT_NAME alone (built artifact stays Maccy.app)
 # and rename it after the build.
@@ -34,7 +47,7 @@ xcodebuild \
   -configuration "$CONFIG" \
   -derivedDataPath "$DERIVED" \
   PRODUCT_BUNDLE_IDENTIFIER=org.p0deje.Maccy.dev \
-  CODE_SIGN_IDENTITY=- \
+  CODE_SIGN_IDENTITY="$SIGN_IDENTITY" \
   CODE_SIGN_STYLE=Manual \
   DEVELOPMENT_TEAM= \
   MACOSX_DEPLOYMENT_TARGET=15.0 \
