@@ -247,10 +247,6 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
       if let removedItemIndex {
         all.remove(at: removedItemIndex)
       }
-    } else {
-      Task {
-        Notifier.notify(body: item.title, sound: .write)
-      }
     }
 
     // Phase 1: count bookkeeping. Eviction happens at load() only, not per
