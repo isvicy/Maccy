@@ -219,6 +219,36 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
     try? Storage.shared.context.save()
   }
 
+  // Lightweight "user pasted an existing item" path. Used instead of the full
+  // add() flow for Maccy-initiated writes — bumps lastCopiedAt/numberOfCopies
+  // and reorders the decorator in place without re-parsing the pasteboard,
+  // round-tripping through SwiftData delete+insert, or forcing a resize.
+  @MainActor
+  func bump(_ item: HistoryItem) {
+    guard let decorator = all.first(where: { $0.item == item }) else {
+      // Item isn't in the loaded window (e.g. pasted from a search result
+      // outside the current page). Fall back to the full path so the user
+      // still sees the bump reflected in history.
+      add(item)
+      return
+    }
+
+    decorator.item.lastCopiedAt = .now
+    decorator.item.numberOfCopies += 1
+    sessionLog[Clipboard.shared.changeCount] = item
+
+    if decorator.item.pin == nil, let oldIndex = all.firstIndex(where: { $0 === decorator }) {
+      let sortedItems = sorter.sort(all.map(\.item))
+      if let newIndex = sortedItems.firstIndex(of: decorator.item), newIndex != oldIndex {
+        all.remove(at: oldIndex)
+        all.insert(decorator, at: newIndex)
+        items = all
+      }
+    }
+
+    try? Storage.shared.context.save()
+  }
+
   @discardableResult
   @MainActor
   func add(_ item: HistoryItem) -> HistoryItemDecorator {

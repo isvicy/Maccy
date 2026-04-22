@@ -102,8 +102,14 @@ class Clipboard {
     pasteboard.setString(item.application ?? "", forType: .source)
     sync()
 
-    Task {
-      checkForChangesInPasteboard()
+    // Suppress re-ingest of our own write. Without this, the pasteboard poller
+    // (and the Task below) runs the full external-copy path — findSimilarItem,
+    // delete+insert, SwiftData save, full re-sort, items= replacement, and a
+    // 200ms window resize — causing the next popup open to feel sluggish.
+    // Instead we record the change counter and do a lightweight in-place bump.
+    changeCount = pasteboard.changeCount
+    Task { @MainActor in
+      History.shared.bump(item)
     }
   }
 
@@ -153,11 +159,17 @@ class Clipboard {
 
     changeCount = pasteboard.changeCount
 
-    if pasteboard.pasteboardItems?.contains(where: { $0.types.contains(.fromMaccy) }) != true {
-      // External copy occurred. Stop the current paste stack.
-      // Maybe queue it into the paste stack? Configurable behaviour?
-      AppState.shared.history.interruptPasteStack()
+    if pasteboard.pasteboardItems?.contains(where: { $0.types.contains(.fromMaccy) }) == true {
+      // Self-write: already recorded via History.bump() in copy(_:). Skip the
+      // rest of the ingestion path — re-parsing the pasteboard, finding the
+      // duplicate, deleting+reinserting in SwiftData, and forcing a resize
+      // animation is what made the next popup open slow after a paste.
+      return
     }
+
+    // External copy occurred. Stop the current paste stack.
+    // Maybe queue it into the paste stack? Configurable behaviour?
+    AppState.shared.history.interruptPasteStack()
 
     if Defaults[.ignoreEvents] {
       if Defaults[.ignoreOnlyNextEvent] {
