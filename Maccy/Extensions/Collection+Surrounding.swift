@@ -50,26 +50,21 @@ extension Collection where Element: Equatable {
 }
 
 extension Array where Element: Equatable {
+  // After-deletion selection target: prefer the item that visually slides up
+  // into the deleted slot (the next match), and fall back to the previous
+  // match only when there is no next. Matches Finder/Mail convention.
   func nearest(to element: Element, where condition: (Element) -> Bool) -> Element? {
     guard let currentIndex = firstIndex(of: element) else {
       return nil
     }
-    let nextNearest = self[currentIndex...].firstIndex(where: { condition($0) })
-    let previousNearest = self[...currentIndex].lastIndex(where: { condition($0) })
-    switch (nextNearest, previousNearest) {
-    case (nil, nil):
-      return nil
-    case (.some(let index), .none):
-      return self[currentIndex + index]
-    case (.none, .some(let index)):
-      return self[index]
-    case (.some(let index1), .some(let index2)):
-      let pos1 = currentIndex + index1
-      let pos2 = index2
-      return abs(pos1 - currentIndex) < abs(pos2 - currentIndex)
-      ? self[pos1]
-      : self[pos2]
+    if currentIndex + 1 < endIndex,
+       let next = self[(currentIndex + 1)...].firstIndex(where: condition) {
+      return self[next]
     }
-
+    if currentIndex > startIndex,
+       let prev = self[..<currentIndex].lastIndex(where: condition) {
+      return self[prev]
+    }
+    return nil
   }
 }
