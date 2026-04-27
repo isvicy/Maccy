@@ -156,6 +156,36 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
     Task {
       AppState.shared.popup.needsResize = true
     }
+    Task { @MainActor in
+      await backfillContentHashes()
+    }
+  }
+
+  // One-time backfill of contentHash for items that pre-date the column being
+  // added. Without it, dedup against pre-existing items would always miss
+  // (predicate sees nil != newHash) until the user re-copies them.
+  // Runs in small batches with yields to avoid stalling the UI on stores
+  // with tens of thousands of items.
+  @MainActor
+  func backfillContentHashes() async {
+    let context = Storage.shared.context
+    let batchSize = 100
+
+    while true {
+      var desc = FetchDescriptor<HistoryItem>(
+        predicate: #Predicate { $0.contentHash == nil }
+      )
+      desc.fetchLimit = batchSize
+      guard let batch = try? context.fetch(desc), !batch.isEmpty else { break }
+
+      for item in batch {
+        item.contentHash = item.computeContentHash()
+      }
+      try? context.save()
+
+      // Yield so the run loop can service hotkey, painting, etc.
+      try? await Task.sleep(for: .milliseconds(50))
+    }
   }
 
   // Append the next page of unpinned items to the loaded window.
@@ -252,6 +282,11 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
   @discardableResult
   @MainActor
   func add(_ item: HistoryItem) -> HistoryItemDecorator {
+    // Stamp the dedup key before storage so the row lands with its hash and
+    // findSimilarItem can use the indexed predicate path.
+    if item.contentHash == nil {
+      item.contentHash = item.computeContentHash()
+    }
     if #available(macOS 15.0, *) {
       try? History.shared.insertIntoStorage(item)
     } else {
@@ -579,17 +614,24 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
 
   @MainActor
   private func findSimilarItem(_ item: HistoryItem) -> HistoryItem? {
-    let descriptor = FetchDescriptor<HistoryItem>()
-    if let all = try? Storage.shared.context.fetch(descriptor) {
-      let duplicates = all.filter({ $0 == item || $0.supersedes(item) })
-      if duplicates.count > 1 {
-        return duplicates.first(where: { $0 != item })
-      } else {
-        return isModified(item)
-      }
+    if item.contentHash == nil {
+      item.contentHash = item.computeContentHash()
+    }
+    let hash = item.contentHash
+
+    var descriptor = FetchDescriptor<HistoryItem>(
+      predicate: #Predicate { $0.contentHash == hash }
+    )
+    // fetchLimit guards against pathological hash collisions; in normal use
+    // there's at most one row per hash, occasionally two while a dup is being
+    // merged.
+    descriptor.fetchLimit = 10
+    let candidates = (try? Storage.shared.context.fetch(descriptor)) ?? []
+    if let dup = candidates.first(where: { $0 != item && $0.supersedes(item) }) {
+      return dup
     }
 
-    return item
+    return isModified(item)
   }
 
   private func isModified(_ item: HistoryItem) -> HistoryItem? {

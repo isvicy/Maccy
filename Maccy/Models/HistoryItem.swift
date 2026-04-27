@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import Defaults
 import Sauce
 import SwiftData
@@ -61,7 +62,9 @@ class HistoryItem {
 
   // SQL index on (pin, lastCopiedAt DESC). Used by Phase 1's lazy windowed
   // load: `WHERE pin IS NULL ORDER BY lastCopiedAt DESC LIMIT N`.
-  #Index<HistoryItem>([\.pin], [\.lastCopiedAt], [\.pin, \.lastCopiedAt])
+  // Index on contentHash drives the dedup lookup in History.findSimilarItem
+  // — without it, dedup degrades to a full table scan.
+  #Index<HistoryItem>([\.pin], [\.lastCopiedAt], [\.pin, \.lastCopiedAt], [\.contentHash])
 
   var application: String?
   var firstCopiedAt: Date = Date.now
@@ -69,6 +72,12 @@ class HistoryItem {
   var numberOfCopies: Int = 1
   var pin: String?
   var title = ""
+
+  // SHA-256 over the deterministic encoding of non-transient (type, value)
+  // pairs — see `computeContentHash`. Stable identity for dedup. nil for
+  // legacy rows pre-backfill; `History.backfillContentHashes` populates them
+  // in the background on launch.
+  var contentHash: Data?
 
   @Relationship(deleteRule: .cascade, inverse: \HistoryItemContent.item)
   var contents: [HistoryItemContent] = []
@@ -87,6 +96,31 @@ class HistoryItem {
       .allSatisfy { content in
         contents.contains(where: { $0.type == content.type && $0.value == content.value })
       }
+  }
+
+  // Deterministic SHA-256 over non-transient contents. Used as an indexed
+  // lookup key for dedup so we can avoid scanning every history item.
+  // Encoding: for each (type, value) pair sorted by type, write
+  //   <utf8 type bytes> 0x00 <4-byte big-endian value length> <value bytes> 0x00
+  // The size prefix prevents ambiguity when type/value bytes happen to
+  // include separator bytes.
+  func computeContentHash() -> Data {
+    var hasher = SHA256()
+    let nonTransient = contents
+      .filter { !Self.transientTypes.contains($0.type) }
+      .sorted { $0.type < $1.type }
+    var separator: UInt8 = 0
+    for content in nonTransient {
+      hasher.update(data: Data(content.type.utf8))
+      hasher.update(data: Data(bytes: &separator, count: 1))
+      var length = UInt32(content.value?.count ?? 0).bigEndian
+      withUnsafeBytes(of: &length) { hasher.update(bufferPointer: $0) }
+      if let value = content.value {
+        hasher.update(data: value)
+      }
+      hasher.update(data: Data(bytes: &separator, count: 1))
+    }
+    return Data(hasher.finalize())
   }
 
   func generateTitle() -> String {
