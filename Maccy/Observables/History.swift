@@ -150,14 +150,18 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
     all = sorter.sort(pinned + unpinned).map { HistoryItemDecorator($0) }
     items = all
 
-    limitHistorySizeOnDisk(to: Defaults[.size])
-
     updateShortcuts()
     Task {
       AppState.shared.popup.needsResize = true
     }
     Task { @MainActor in
       await backfillContentHashes()
+    }
+    // Eviction runs in the background — keeps load() unblocked even when
+    // the user lowers the size cap below the current on-disk count, which
+    // could otherwise mean tens of thousands of rows to delete on launch.
+    Task { @MainActor in
+      await limitHistorySizeOnDisk(to: Defaults[.size])
     }
   }
 
@@ -218,27 +222,48 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
 
   // Evict items beyond maxSize from the on-disk store *and* from the loaded window.
   // Replaces the old `limitHistorySize`, which only operated on the in-memory `all` array.
+  // Page-and-batch eviction. The legacy version fetched every row past
+  // `maxSize` in one shot, materialising thousands of @Model objects on the
+  // main thread. With a 30k+ history that stalled load(). We fetch one
+  // batch at a time, yield between batches, and re-check the count so the
+  // run can stop as soon as we're under the cap.
   @MainActor
-  private func limitHistorySizeOnDisk(to maxSize: Int) {
-    guard totalUnpinnedOnDisk > maxSize else { return }
-    var desc = FetchDescriptor<HistoryItem>(
-      predicate: #Predicate { $0.pin == nil },
-      sortBy: [SortDescriptor(\.lastCopiedAt, order: .reverse)]
-    )
-    desc.fetchOffset = maxSize
-    guard let toEvict = try? Storage.shared.context.fetch(desc), !toEvict.isEmpty else { return }
-    for item in toEvict {
-      if let dec = all.first(where: { $0.item == item }) {
-        delete(dec)
-      } else {
-        // Not in loaded window; delete directly from store.
-        Storage.shared.context.delete(item)
+  private func limitHistorySizeOnDisk(to maxSize: Int) async {
+    let context = Storage.shared.context
+    let batchSize = 200
+
+    while true {
+      let count = (try? context.fetchCount(
+        FetchDescriptor<HistoryItem>(predicate: #Predicate { $0.pin == nil })
+      )) ?? 0
+      guard count > maxSize else {
+        totalUnpinnedOnDisk = count
+        return
       }
+
+      var desc = FetchDescriptor<HistoryItem>(
+        predicate: #Predicate { $0.pin == nil },
+        sortBy: [SortDescriptor(\.lastCopiedAt, order: .reverse)]
+      )
+      desc.fetchOffset = maxSize
+      desc.fetchLimit = batchSize
+      guard let toEvict = try? context.fetch(desc), !toEvict.isEmpty else {
+        totalUnpinnedOnDisk = count
+        return
+      }
+
+      for item in toEvict {
+        if let dec = all.first(where: { $0.item == item }) {
+          delete(dec)
+        } else {
+          // Not in loaded window; delete directly from store.
+          context.delete(item)
+        }
+      }
+      try? context.save()
+
+      try? await Task.sleep(for: .milliseconds(50))
     }
-    try? Storage.shared.context.save()
-    totalUnpinnedOnDisk = (try? Storage.shared.context.fetchCount(
-      FetchDescriptor<HistoryItem>(predicate: #Predicate { $0.pin == nil })
-    )) ?? totalUnpinnedOnDisk
   }
 
   @MainActor
@@ -268,11 +293,16 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
     sessionLog[Clipboard.shared.changeCount] = item
 
     if decorator.item.pin == nil, let oldIndex = all.firstIndex(where: { $0 === decorator }) {
-      let sortedItems = sorter.sort(all.map(\.item))
-      if let newIndex = sortedItems.firstIndex(of: decorator.item), newIndex != oldIndex {
-        all.remove(at: oldIndex)
+      // Remove first so the binary search is over the array sans this item;
+      // otherwise insertionIndex could land on the slot the item still occupies
+      // and we'd reinsert at the same position even when a move is needed.
+      all.remove(at: oldIndex)
+      let newIndex = sorter.insertionIndex(for: decorator.item, in: all)
+      if newIndex != oldIndex {
         all.insert(decorator, at: newIndex)
         items = all
+      } else {
+        all.insert(decorator, at: oldIndex)
       }
     }
 
@@ -335,10 +365,10 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
     } else {
       itemDecorator = HistoryItemDecorator(item)
 
-      let sortedItems = sorter.sort(all.map(\.item) + [item])
-      if let index = sortedItems.firstIndex(of: item) {
-        all.insert(itemDecorator, at: index)
-      }
+      // `all` is already sorted; binary-search the insertion point instead of
+      // re-sorting the full loaded window on every external copy.
+      let index = sorter.insertionIndex(for: item, in: all)
+      all.insert(itemDecorator, at: index)
       // Net new unpinned item now in `all`. (Duplicate replacement net-zero.)
       if removedItemIndex == nil {
         loadedUnpinnedCount += 1
